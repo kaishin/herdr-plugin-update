@@ -46,7 +46,7 @@ case "$(uname -s)-$(uname -m)" in
     *) echo "herdr-auto-update: unsupported platform $(uname -s)-$(uname -m)" >&2; exit 1 ;;
 esac
 ASSET="herdr-auto-update-$VERSION-$TRIPLE.tar.gz"
-REPO="dio16/herdr-auto-update"
+REPO="kaishin/herdr-plugin-update"
 
 CACHE_DIR="$DIR/.cache"
 CACHED_BIN="$CACHE_DIR/herdr-auto-update-$VERSION-$TRIPLE"

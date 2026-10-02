@@ -28,6 +28,7 @@ die()  { fail "$*"; exit 1; }
 command -v gh >/dev/null || die "gh CLI is required (https://cli.github.com)"
 command -v cargo >/dev/null || die "cargo is required"
 
+REPO="kaishin/herdr-plugin-update"
 TARGET="${1:-$(git rev-parse origin/main)}"
 say "${BOLD}Releasing commit ${TARGET}${RESET}"
 say
@@ -56,7 +57,7 @@ ok "fmt / clippy / tests green locally"
 
 # ---- 3. CI gate ------------------------------------------------------------
 say "checking CI status for $TARGET ..."
-runs=$(gh run list --commit "$TARGET" --json databaseId,status,conclusion,displayTitle 2>/dev/null || true)
+runs=$(gh run list --repo "$REPO" --commit "$TARGET" --json databaseId,status,conclusion,displayTitle 2>/dev/null || true)
 if [ -z "$runs" ] || [ "$(printf '%s' "$runs" | grep -c databaseId)" -eq 0 ]; then
     die "no CI runs found for $TARGET — CI has not run, refusing to release"
 fi
@@ -69,7 +70,7 @@ while read -r run; do
         die "run $id ($title) is $status, not completed — wait for CI before releasing"
     fi
     if [ "$conclusion" != "success" ]; then
-        die "run $id ($title) concluded $conclusion — CI is RED, refusing to release (see https://github.com/dio16/herdr-auto-update/actions/runs/$id)"
+        die "run $id ($title) concluded $conclusion — CI is RED, refusing to release (see https://github.com/$REPO/actions/runs/$id)"
     fi
     ok "CI run $id ($title) green"
 done < <(printf '%s' "$runs" | jq -c '.[]')
@@ -88,5 +89,5 @@ git tag "$tag" "$TARGET"
 git push origin "$tag"
 say "created and pushed tag $tag"
 
-printf '%s' "$notes" | gh release create "$tag" --title "$tag" --notes-file -
-ok "release $tag created: https://github.com/dio16/herdr-auto-update/releases/tag/$tag"
+printf '%s' "$notes" | gh release create "$tag" --repo "$REPO" --title "$tag" --notes-file -
+ok "release $tag created: https://github.com/$REPO/releases/tag/$tag"

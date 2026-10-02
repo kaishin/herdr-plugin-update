@@ -58,7 +58,7 @@ $TRIPLE = if ($os -like "*Windows*") {
 }
 
 $ASSET = "herdr-auto-update-$VERSION-$TRIPLE.tar.gz"
-$REPO = "dio16/herdr-auto-update"
+$REPO = "kaishin/herdr-plugin-update"
 
 $CACHE_DIR = Join-Path $DIR ".cache"
 $CACHED_BIN = Join-Path $CACHE_DIR "herdr-auto-update-$VERSION-$TRIPLE.exe"

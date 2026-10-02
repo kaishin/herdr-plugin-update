@@ -63,7 +63,7 @@ which replaces the managed checkout while preserving plugin config and state.
 ## Install
 
 ```bash
-herdr plugin install dio16/herdr-auto-update
+herdr plugin install kaishin/herdr-plugin-update --ref v1.0.13
 ```
 
 No Rust toolchain is required: the manifest's `[[build]]` steps are not
@@ -79,7 +79,7 @@ install:
 
 ```bash
 herdr plugin unlink herdr-auto-update
-herdr plugin install dio16/herdr-auto-update
+herdr plugin install kaishin/herdr-plugin-update --ref v1.0.13
 ```
 
 Enable the actions you want in `~/.config/herdr/config.toml`
@@ -375,7 +375,7 @@ repository on GitHub (the index refreshes automatically).
   herdr's own installer. The only files it writes are `state.json` and
   `compare-cache.json` in herdr's plugin config directory (needed for
   rollback and rate-limit-safe classification).
-- Prebuilt binaries are downloaded from the `dio16/herdr-auto-update`
+- Prebuilt binaries are downloaded from the `kaishin/herdr-plugin-update`
   GitHub release matching the pinned version and verified against the
   release's SHA256 checksum before execution. The binary is cached under
   `bin/.cache/` (gitignored). The `bin/` launcher falls back to a local
