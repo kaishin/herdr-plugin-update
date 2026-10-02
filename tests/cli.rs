@@ -27,6 +27,7 @@ ref=""
 for a in "$@"; do
   case "$a" in
     https://github.com/*) url="$a" ;;
+    *'^{}') ;;
     refs/*) ref="$a" ;;
   esac
 done
@@ -43,7 +44,7 @@ esac
 case "$url" in
   *herdr-flock*)
     if [ -n "$ref" ]; then
-      echo "1111111111111111111111111111111111111111 HEAD"
+      echo "1111111111111111111111111111111111111111 $ref"
     else
       echo "ae24844b3c8b1cf7cf3dfc3d6e6bc701b6e048a3 HEAD"
     fi
@@ -55,6 +56,9 @@ esac
 
 const STUB_GIT_CMD: &str = "@echo off\r\n\
 set \"has_ref=no\"\r\n\
+set \"ref_name=refs/heads/stable\"\r\n\
+echo %* | findstr /c:\"refs/tags/v1.0.0\" >nul\r\n\
+if not errorlevel 1 set \"ref_name=refs/tags/v1.0.0\"\r\n\
 for %%a in (%*) do (\r\n\
   echo %%a | findstr /c:\"refs/\" >nul\r\n\
   if not errorlevel 1 set \"has_ref=yes\"\r\n\
@@ -69,7 +73,7 @@ if not errorlevel 1 (\r\n\
 )\r\n\
 echo %* | findstr /c:\"herdr-flock\" >nul\r\n\
 if not errorlevel 1 (\r\n\
-  if \"%has_ref%\"==\"yes\" ( echo 1111111111111111111111111111111111111111 HEAD & exit /b 0 )\r\n\
+  if \"%has_ref%\"==\"yes\" ( echo 1111111111111111111111111111111111111111 %ref_name% & exit /b 0 )\r\n\
   echo ae24844b3c8b1cf7cf3dfc3d6e6bc701b6e048a3 HEAD & exit /b 0\r\n\
 )\r\n\
 echo %* | findstr /c:\"herdr-file-viewer\" >nul\r\n\
@@ -83,7 +87,10 @@ if [ "$1" = "plugin" ] && [ "$2" = "list" ]; then
 fi
 if [ "$1" = "plugin" ] && [ "$2" = "install" ]; then
   echo "$@" >> "$(dirname "$0")/installs.log"
-  exit 0
+  echo "installer output"
+  if [ -f "$(dirname "$0")/no-mutation" ]; then exit 0; fi
+  HAU_STUB_SOURCE="$3" HAU_STUB_REF="$5" "$HAU_TEST_EXE" --ignored --exact stub_install_entrypoint >/dev/null
+  exit $?
 fi
 if [ "$1" = "plugin" ] && [ "$2" = "config-dir" ]; then
   echo "$(dirname "$0")/plugin-config"
@@ -103,6 +110,11 @@ if \"%1\"==\"plugin\" if \"%2\"==\"list\" (\r\n\
 )\r\n\
 if \"%1\"==\"plugin\" if \"%2\"==\"install\" (\r\n\
   echo %*>> \"%~dp0installs.log\"\r\n\
+  echo installer output\r\n\
+  if exist \"%~dp0no-mutation\" exit /b 0\r\n\
+  set \"HAU_STUB_SOURCE=%3\"\r\n\
+  set \"HAU_STUB_REF=%5\"\r\n\
+  \"%HAU_TEST_EXE%\" --ignored --exact stub_install_entrypoint >nul\r\n\
   exit /b 0\r\n\
 )\r\n\
 if \"%1\"==\"plugin\" if \"%2\"==\"config-dir\" (\r\n\
@@ -185,6 +197,8 @@ fn run(dir: &Path, args: &[&str], config: Option<&Path>) -> Output {
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_herdr-auto-update"));
     cmd.args(args)
+        .env("HAU_TEST_EXE", std::env::current_exe().unwrap())
+        .env("HAU_STUB_REGISTRY", dir.join("registry.json"))
         .env("HERDR_BIN_PATH", &stub_herdr)
         .env("HERDR_AUTO_UPDATE_GIT", &stub_git)
         .env("HERDR_AUTO_UPDATE_CURL", &stub_curl)
@@ -198,6 +212,258 @@ fn run(dir: &Path, args: &[&str], config: Option<&Path>) -> Output {
 
 fn stdout_of(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Executed only by the installer shim; no Python/jq dependency on test hosts.
+#[test]
+#[ignore]
+fn stub_install_entrypoint() {
+    let path = std::env::var("HAU_STUB_REGISTRY").unwrap();
+    let spec = std::env::var("HAU_STUB_SOURCE").unwrap();
+    let requested = std::env::var("HAU_STUB_REF").unwrap_or_default();
+    let requested = (!requested.is_empty()).then_some(requested);
+    let (owner, repo) = spec.split_once('/').unwrap();
+    let sha = match requested.as_deref() {
+        Some(r) if r.len() == 40 => r.to_string(),
+        Some(_) if repo == "herdr-flock" => "1".repeat(40),
+        _ if repo == "herdr-flock" => "ae24844b3c8b1cf7cf3dfc3d6e6bc701b6e048a3".into(),
+        _ => "71d4c1c3706e7958c714789b035a99d949620a9e".into(),
+    };
+    let mut registry: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    for p in registry["result"]["plugins"].as_array_mut().unwrap() {
+        let s = &mut p["source"];
+        if s["owner"] == owner && s["repo"] == repo {
+            s["resolved_commit"] = serde_json::json!(sha);
+            s["requested_ref"] = serde_json::json!(requested);
+        }
+    }
+    std::fs::write(path, serde_json::to_string(&registry).unwrap()).unwrap();
+}
+
+#[test]
+fn sha_installs_preserve_tracking_and_manual_overrides() {
+    let dir = setup("tracking-metadata");
+    let cfg = auto_cfg(&dir, "");
+    for id in ["pinned.old", "herdr-file-viewer"] {
+        let out = run(&dir, &["apply", "--json", "--only", id], Some(&cfg));
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(report["updated"][0], id);
+        assert!(String::from_utf8_lossy(&out.stderr).contains("installer output"));
+        let out = run(&dir, &["check", "--json", "--only", id], Some(&cfg));
+        let statuses: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(statuses[0]["ref_kind"], "branch");
+        if id == "pinned.old" {
+            assert_eq!(statuses[0]["requested_ref"], "refs/heads/stable");
+        } else {
+            assert!(statuses[0].get("requested_ref").is_none());
+        }
+    }
+    let mut registry: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("registry.json")).unwrap()).unwrap();
+    let source = &mut registry["result"]["plugins"][1]["source"];
+    source["owner"] = serde_json::json!("other");
+    write_registry(&dir, &registry.to_string());
+    let out = run(
+        &dir,
+        &["check", "--json", "--only", "herdr-file-viewer"],
+        Some(&cfg),
+    );
+    let statuses: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(statuses[0]["ref_kind"], "commit");
+    registry["result"]["plugins"][1]["source"]["owner"] = serde_json::json!("smarzban");
+    registry["result"]["plugins"][1]["source"]["requested_ref"] = serde_json::json!("c".repeat(40));
+    write_registry(&dir, &registry.to_string());
+    let out = run(
+        &dir,
+        &["check", "--json", "--only", "herdr-file-viewer"],
+        Some(&cfg),
+    );
+    let statuses: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(statuses[0]["ref_kind"], "commit");
+}
+
+#[test]
+fn unsafe_or_unverified_install_is_failed() {
+    let dir = setup("tracking-persist-failure");
+    let cfg = auto_cfg(&dir, "");
+    std::fs::create_dir(dir.join("state.json.tmp")).unwrap();
+    let out = run(
+        &dir,
+        &["apply", "--json", "--only", "herdr-file-viewer"],
+        Some(&cfg),
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(installs(&dir).is_empty());
+    std::fs::remove_dir(dir.join("state.json.tmp")).unwrap();
+    std::fs::write(dir.join("no-mutation"), "").unwrap();
+    let out = run(
+        &dir,
+        &["apply", "--json", "--only", "herdr-file-viewer"],
+        Some(&cfg),
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["failed"][0], "herdr-file-viewer");
+    assert!(report["updated"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn short_annotated_tag_is_immutable_and_tracks_after_sha_install() {
+    let dir = setup("short-tag-peeling");
+    let cfg = auto_cfg(&dir, "");
+    write_registry(&dir, &serde_json::json!({"result": {"plugins": [{
+        "plugin_id": "tagged", "source": {"kind": "github", "owner": "ragamo", "repo": "herdr-flock",
+        "resolved_commit": "c".repeat(40), "requested_ref": "v1.0"}
+    }]}}).to_string());
+    let rows = format!(
+        "{} refs/tags/v1.0\n{} refs/tags/v1.0^{{}}",
+        "a".repeat(40),
+        "b".repeat(40)
+    );
+    if cfg!(windows) {
+        std::fs::write(dir.join("stub-git.cmd"), format!("@echo off\r\necho {} refs/tags/v1.0\r\necho {} refs/tags/v1.0^^{{}}\r\nexit /b 0\r\n", "a".repeat(40), "b".repeat(40))).unwrap();
+    } else {
+        std::fs::write(
+            dir.join("stub-git.sh"),
+            format!("#!/bin/sh\nprintf '%s\\n' '{rows}'\n"),
+        )
+        .unwrap();
+    }
+    let out = run(&dir, &["plan", "--json"], Some(&cfg));
+    assert_eq!(out.status.code(), Some(0));
+    let plan: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(plan[0]["ref_kind"], "tag");
+    assert_eq!(plan[0]["remote_sha"], "b".repeat(40));
+    assert_eq!(plan[0]["action"], "hold");
+    let cfg = auto_cfg(&dir, "immutable_pins = false\n");
+    let out = run(&dir, &["apply", "--json"], Some(&cfg));
+    assert_eq!(out.status.code(), Some(0));
+    assert!(installs(&dir).contains(&format!("--ref {}", "b".repeat(40))));
+    let out = run(&dir, &["check", "--json"], Some(&cfg));
+    let statuses: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(statuses[0]["ref_kind"], "tag");
+    assert_eq!(statuses[0]["requested_ref"], "v1.0");
+}
+
+#[test]
+fn rollback_quarantines_locally_tracked_sha_and_resume_restores_ref() {
+    let dir = setup("tracking-rollback-resume");
+    let cfg = auto_cfg(&dir, "");
+    let out = run(
+        &dir,
+        &["apply", "--json", "--only", "pinned.old"],
+        Some(&cfg),
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let out = run(
+        &dir,
+        &["rollback", "--json", "--only", "pinned.old"],
+        Some(&cfg),
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["rolled_back"][0], "pinned.old");
+    let out = run(
+        &dir,
+        &["check", "--json", "--only", "pinned.old"],
+        Some(&cfg),
+    );
+    let statuses: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(statuses[0]["ref_kind"], "commit");
+    let out = run(
+        &dir,
+        &["resume", "--json", "--only", "pinned.old"],
+        Some(&cfg),
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["resumed"][0], "pinned.old");
+    let out = run(
+        &dir,
+        &["check", "--json", "--only", "pinned.old"],
+        Some(&cfg),
+    );
+    let statuses: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(statuses[0]["requested_ref"], "refs/heads/stable");
+}
+
+#[test]
+fn untrack_json_reports_verified_success_and_failure() {
+    let dir = setup("untrack-json");
+    let cfg = auto_cfg(&dir, "");
+    let registry = serde_json::json!({"result": {"plugins": [{"plugin_id": "pinned", "source": {
+        "kind": "github", "owner": "ragamo", "repo": "herdr-flock",
+        "resolved_commit": "a".repeat(40), "requested_ref": "a".repeat(40)
+    }}]}})
+    .to_string();
+    write_registry(&dir, &registry);
+    std::fs::write(dir.join("no-mutation"), "").unwrap();
+    let out = run(&dir, &["untrack", "--json", "--only", "pinned"], Some(&cfg));
+    assert_eq!(out.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["failed"], serde_json::json!(["pinned"]));
+    std::fs::remove_file(dir.join("no-mutation")).unwrap();
+    let out = run(&dir, &["untrack", "--json", "--only", "pinned"], Some(&cfg));
+    assert_eq!(out.status.code(), Some(0));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["untracked"], serde_json::json!(["pinned"]));
+}
+
+#[test]
+fn recovery_json_reports_empty_and_partial_failures() {
+    let dir = setup("recovery-json-failures");
+    let cfg = auto_cfg(&dir, "");
+    let mut registry: serde_json::Value = serde_json::from_str(REGISTRY).unwrap();
+    let mut no_sha = registry["result"]["plugins"][1].clone();
+    no_sha["plugin_id"] = serde_json::json!("no-sha");
+    registry["result"]["plugins"]
+        .as_array_mut()
+        .unwrap()
+        .push(no_sha);
+    write_registry(&dir, &registry.to_string());
+    for (command, key) in [("rollback", "rolled_back"), ("resume", "resumed")] {
+        std::fs::remove_file(dir.join("state.json")).ok();
+        let out = run(&dir, &[command, "--json"], Some(&cfg));
+        assert_eq!(out.status.code(), Some(0));
+        let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(report[key], serde_json::json!([]));
+        let result = if command == "rollback" {
+            "updated"
+        } else {
+            "rolled_back"
+        };
+        let entries: Vec<_> = ["herdr-file-viewer", "missing", "no-sha"]
+            .into_iter()
+            .map(|id| {
+                serde_json::json!({
+                "plugin_id": id, "previous_sha": if id == "no-sha" { String::new() } else { "a".repeat(40) }, "current_sha": if id == "no-sha" { String::new() } else { "b".repeat(40) },
+                    "updated_at": "now", "result": result
+                })
+            })
+            .collect();
+        std::fs::write(
+            dir.join("state.json"),
+            serde_json::json!({"version": 1, "entries": entries}).to_string(),
+        )
+        .unwrap();
+        let out = run(&dir, &[command, "--json"], Some(&cfg));
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(report[key], serde_json::json!(["herdr-file-viewer"]));
+        assert_eq!(report["failed"].as_array().unwrap().len(), 2);
+    }
 }
 
 fn installs(dir: &Path) -> String {
@@ -356,7 +622,7 @@ fn update_reinstalls_only_outdated_via_herdr_cli() {
     );
     let log = installs(&dir);
     assert!(
-        log.contains("plugin install smarzban/herdr-file-viewer --yes"),
+        log.contains("plugin install smarzban/herdr-file-viewer --ref 71d4c1c3706e7958c714789b035a99d949620a9e --yes"),
         "install log: {log}"
     );
     // flock.farm is up to date and pinned.stable matches its pinned ref, so
@@ -498,8 +764,8 @@ fn update_passes_ref_flag_for_pinned_plugins() {
     );
     let log = installs(&dir);
     assert!(
-        log.contains("ragamo/herdr-flock --ref refs/heads/stable"),
-        "pinned reinstall must keep the ref: {log}"
+        log.contains("ragamo/herdr-flock --ref 1111111111111111111111111111111111111111"),
+        "pinned reinstall must use the verified SHA: {log}"
     );
     // pinned.stable matches the pinned ref and must not be reinstalled.
     let flock_installs: Vec<&str> = log
@@ -664,6 +930,7 @@ ref=""
 for a in "$@"; do
   case "$a" in
     https://github.com/*) url="$a" ;;
+    *'^{}') ;;
     refs/*) ref="$a" ;;
   esac
 done
@@ -671,7 +938,7 @@ echo "git ${url:-<none>}" >> "$log"
 case "$url" in
   *herdr-flock*)
     if [ -n "$ref" ]; then
-      echo "1111111111111111111111111111111111111111 HEAD"
+      echo "1111111111111111111111111111111111111111 $ref"
     else
       echo "ae24844b3c8b1cf7cf3dfc3d6e6bc701b6e048a3 HEAD"
     fi
@@ -693,7 +960,7 @@ for %%a in (%*) do (\r\n\
 )\r\n\
 echo %* | findstr /c:\"herdr-flock\" >nul\r\n\
 if not errorlevel 1 (\r\n\
-  if \"%has_ref%\"==\"yes\" ( echo 1111111111111111111111111111111111111111 HEAD & exit /b 0 )\r\n\
+  if \"%has_ref%\"==\"yes\" ( echo 1111111111111111111111111111111111111111 refs/heads/stable & exit /b 0 )\r\n\
   echo ae24844b3c8b1cf7cf3dfc3d6e6bc701b6e048a3 HEAD & exit /b 0\r\n\
 )\r\n\
 echo %* | findstr /c:\"herdr-file-viewer\" >nul\r\n\

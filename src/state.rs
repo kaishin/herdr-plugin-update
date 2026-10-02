@@ -24,6 +24,19 @@ pub struct StateEntry {
 pub struct State {
     pub version: u32,
     pub entries: Vec<StateEntry>,
+    #[serde(default)]
+    pub tracking: Vec<TrackingEntry>,
+}
+
+/// Only restores tracking for the exact SHA pin written by this plugin.
+/// A pending install is safe: it cannot match the old registry row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrackingEntry {
+    pub plugin_id: String,
+    pub owner: String,
+    pub repo: String,
+    pub installed_sha: String,
+    pub requested_ref: Option<String>,
 }
 
 const STATE_VERSION: u32 = 1;
@@ -39,13 +52,25 @@ impl State {
         serde_json::from_str(&text).unwrap_or_default()
     }
 
-    /// Best-effort persist. Errors are reported to the caller (stderr), but
-    /// a failed state write must not change update semantics.
+    /// Atomically replace state; callers must persist tracking before install.
     pub fn save(&self, dir: &Path) -> Result<(), String> {
         let text = serde_json::to_string_pretty(self)
             .map_err(|e| format!("cannot serialize state: {e}"))?;
-        std::fs::write(dir.join(STATE_FILE), text)
-            .map_err(|e| format!("cannot write {}: {e}", STATE_FILE))
+        std::fs::create_dir_all(dir).map_err(|e| format!("cannot create state dir: {e}"))?;
+        let pending = dir.join("state.json.tmp");
+        let mut file =
+            std::fs::File::create(&pending).map_err(|e| format!("cannot write state: {e}"))?;
+        use std::io::Write;
+        file.write_all(text.as_bytes())
+            .and_then(|_| file.sync_all())
+            .map_err(|e| format!("cannot write state: {e}"))?;
+        std::fs::rename(pending, dir.join(STATE_FILE))
+            .map_err(|e| format!("cannot replace state: {e}"))?;
+        #[cfg(unix)]
+        std::fs::File::open(dir)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| format!("cannot sync state dir: {e}"))?;
+        Ok(())
     }
 
     pub fn append(&mut self, e: StateEntry) {

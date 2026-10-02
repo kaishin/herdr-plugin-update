@@ -8,7 +8,7 @@ use crate::registry;
 use crate::state;
 use serde::Serialize;
 use std::collections::HashSet;
-use std::io::{IsTerminal, Read, Write};
+use std::io::{IsTerminal, Read};
 use std::process::{Child, Command, ExitCode, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -280,54 +280,6 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
                 if e.status == Status::Same {
                     if e.ref_kind == RefKind::Commit {
                         let note = e.reason.as_deref().unwrap_or("");
-                        // Manual `update` from a terminal: offer to reinstall
-                        // the pinned plugin from its default branch, which
-                        // clears the pin and moves it to the latest commit in
-                        // one step. herdr startup and scripts (non-TTY stdin)
-                        // never prompt - they keep the pinned report only.
-                        // Rollback quarantines stay on `resume` (it restores
-                        // the original tracking ref, not just the default
-                        // branch).
-                        let interactive = !json && std::io::stdin().is_terminal();
-                        if interactive && !note.starts_with("pinned by rollback") {
-                            print!(
-                                "  [{}] pinned to a commit (installed {from}); reinstall \
-                                 from the default branch to update? [y/N] ",
-                                e.plugin_id
-                            );
-                            let _ = std::io::stdout().flush();
-                            let mut ans = String::new();
-                            let _ = std::io::stdin().read_line(&mut ans);
-                            if yes_answer(&ans) {
-                                if apply_update(&e.owner, &e.repo, None) {
-                                    let current_sha = resolved_commit_of(&e.plugin_id)
-                                        .unwrap_or_else(|| e.installed_sha.clone());
-                                    record_pin_update(cfg, e, &current_sha);
-                                    if !json {
-                                        println!(
-                                            "{} [{}] ({from} -> {})",
-                                            green(color, "✓ Updated"),
-                                            e.plugin_id,
-                                            short(&current_sha)
-                                        );
-                                    }
-                                    updated.push(e.plugin_id.clone());
-                                } else {
-                                    if !json {
-                                        eprintln!(
-                                            "{} [{}] reinstall failed",
-                                            red(color, "✗ Update failed"),
-                                            e.plugin_id
-                                        );
-                                    }
-                                    failed.push(e.plugin_id.clone());
-                                }
-                                continue;
-                            }
-                            if !json {
-                                println!("  [{}] keeping commit pin", e.plugin_id);
-                            }
-                        }
                         pinned.push(e.plugin_id.clone());
                         if !json {
                             let hint = if note.starts_with("pinned by rollback") {
@@ -386,12 +338,24 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
                     println!("  [{}] updating {from} -> {to}{pin}", e.plugin_id);
                 }
                 let label = format!("updating {} {from} -> {to}{pin}", e.plugin_id);
-                let ok = crate::progress::with_activity(&label, {
-                    let owner = e.owner.clone();
-                    let repo = e.repo.clone();
-                    let requested_ref = e.requested_ref.clone();
-                    move || apply_update(&owner, &repo, requested_ref.as_deref())
-                });
+                let prepared = prepare_tracking(cfg, e);
+                let ok = match prepared {
+                    Ok(()) => crate::progress::with_activity(&label, json, {
+                        let e = e.clone();
+                        move || {
+                            install_verified(
+                                &e.plugin_id,
+                                &e.owner,
+                                &e.repo,
+                                e.remote_sha.as_deref().expect("prepared SHA"),
+                            )
+                        }
+                    }),
+                    Err(err) => {
+                        eprintln!("  [{}] {err}", e.plugin_id);
+                        false
+                    }
+                };
                 if !json {
                     if ok {
                         println!(
@@ -442,9 +406,8 @@ pub fn run_apply(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
                 pinned.join(", ")
             );
             eprintln!(
-                "[herdr-auto-update] hint: run `herdr-auto-update update` from a terminal to \
-                 update pinned plugins interactively; `untrack --only <plugin_id>` switches \
-                 one to the default branch non-interactively"
+                "[herdr-auto-update] hint: `untrack --only <plugin_id>` explicitly switches \
+                  a commit pin to the default branch"
             );
         }
         if !errors.is_empty() {
@@ -606,7 +569,7 @@ fn notify(cfg: &Config, updated: usize, failed: usize, errors: usize, held: usiz
 /// Reinstall one plugin through herdr's own installer (herdr v1 has no
 /// dedicated `plugin update`; reinstall replaces the managed checkout while
 /// preserving plugin config/state). A plugin pinned with `--ref` at install
-/// time is reinstalled against the same ref, not the default branch.
+/// time can be reinstalled at a verified SHA or an explicit recovery ref.
 fn apply_update(owner: &str, repo: &str, requested_ref: Option<&str>) -> bool {
     let bin = registry::herdr_bin();
     let spec = format!("{owner}/{repo}");
@@ -615,7 +578,11 @@ fn apply_update(owner: &str, repo: &str, requested_ref: Option<&str>) -> bool {
     if let Some(r) = requested_ref {
         cmd.args(["--ref", r]);
     }
-    match cmd.arg("--yes").status() {
+    match cmd
+        .arg("--yes")
+        .stdout(Stdio::from(std::io::stderr()))
+        .status()
+    {
         Ok(s) if s.success() => true,
         Ok(s) => {
             eprintln!("  install for {spec} failed with {s}");
@@ -628,9 +595,8 @@ fn apply_update(owner: &str, repo: &str, requested_ref: Option<&str>) -> bool {
     }
 }
 
-/// Record a successful update in state.json (§5.8), then verify herdr's
-/// registry now resolves the plugin to the new commit. Best-effort: a write
-/// failure or verify mismatch is reported, never fatal.
+/// Append history after a verified install. Tracking was already persisted;
+/// failure to append history does not erase the original tracking ref.
 fn record_update(cfg: &Config, e: &PlanEntry) {
     let Some(dir) = cfg.data_dir() else { return };
     let mut st = state::State::load(&dir);
@@ -644,53 +610,68 @@ fn record_update(cfg: &Config, e: &PlanEntry) {
     });
     if let Err(err) = st.save(&dir) {
         eprintln!("  warning: {err}");
-        return;
     }
-    if let Some(expected) = &e.remote_sha {
-        match verify_installed(&e.plugin_id, expected) {
-            Ok(true) => {}
-            Ok(false) => eprintln!(
-                "  [{}] warning: verify failed - registry still reports the old commit",
-                e.plugin_id
-            ),
-            Err(err) => eprintln!("  [{}] warning: verify error: {err}", e.plugin_id),
+}
+
+/// Persist the tracking channel before installing a SHA pin.
+fn prepare_tracking(cfg: &Config, e: &PlanEntry) -> Result<(), String> {
+    let dir = cfg
+        .data_dir()
+        .ok_or("no config dir; cannot preserve tracking ref")?;
+    let sha = e.remote_sha.as_ref().ok_or("no verified remote commit")?;
+    let mut st = state::State::load(&dir);
+    st.tracking.retain(|t| {
+        !(t.plugin_id == e.plugin_id
+            && t.owner == e.owner
+            && t.repo == e.repo
+            && t.installed_sha == *sha)
+    });
+    st.tracking.push(state::TrackingEntry {
+        plugin_id: e.plugin_id.clone(),
+        owner: e.owner.clone(),
+        repo: e.repo.clone(),
+        installed_sha: sha.clone(),
+        requested_ref: e.requested_ref.clone(),
+    });
+    st.save(&dir)
+}
+
+fn install_verified(id: &str, owner: &str, repo: &str, sha: &str) -> bool {
+    if !apply_update(owner, repo, Some(sha)) {
+        return false;
+    }
+    match verify_installed(id, owner, repo, sha) {
+        Ok(true) => true,
+        Ok(false) => {
+            eprintln!("  [{id}] install verification mismatch");
+            false
+        }
+        Err(err) => {
+            eprintln!("  [{id}] install verification error: {err}");
+            false
         }
     }
-}
-
-/// Record a pin-clearing reinstall as an update entry (v1.0.8): the plugin
-/// moved from a commit pin to the default branch's latest commit via the
-/// interactive `update` path.
-fn record_pin_update(cfg: &Config, e: &PlanEntry, new_sha: &str) {
-    let Some(dir) = cfg.data_dir() else { return };
-    let mut st = state::State::load(&dir);
-    st.append(state::StateEntry {
-        plugin_id: e.plugin_id.clone(),
-        previous_sha: e.installed_sha.clone(),
-        current_sha: new_sha.to_string(),
-        requested_ref: None,
-        updated_at: state::rfc3339_now(),
-        result: "updated".to_string(),
-    });
-    if let Err(err) = st.save(&dir) {
-        eprintln!("  warning: {err}");
-    }
-}
-
-/// Interactive prompt answer: `y` / `yes` (case-insensitive) accept.
-fn yes_answer(ans: &str) -> bool {
-    matches!(ans.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 /// Confirm herdr's registry resolves `plugin_id` to `expected` (the commit we
 /// just installed). Uses the same registry path as `check`, so a stale
 /// registry row reads as not-verified.
-fn verify_installed(plugin_id: &str, expected: &str) -> Result<bool, String> {
+fn verify_installed(
+    plugin_id: &str,
+    owner: &str,
+    repo: &str,
+    expected: &str,
+) -> Result<bool, String> {
     let plugins = registry::list_installed()?;
     Ok(plugins
         .iter()
         .find(|p| p.plugin_id == plugin_id)
         .and_then(|p| p.source.as_ref())
+        .filter(|s| {
+            s.kind == registry::GITHUB_KIND
+                && s.owner.as_deref() == Some(owner)
+                && s.repo.as_deref() == Some(repo)
+        })
         .and_then(|s| s.resolved_commit.as_deref())
         .map(|sha| sha == expected)
         .unwrap_or(false))
@@ -725,11 +706,8 @@ pub fn run_rollback(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
             }
         },
         None => {
-            if st.entries.is_empty() {
-                if !json {
-                    eprintln!("[herdr-auto-update] no updates recorded - nothing to roll back");
-                }
-                return ExitCode::SUCCESS;
+            if st.entries.is_empty() && !json {
+                eprintln!("[herdr-auto-update] no updates recorded - nothing to roll back");
             }
             let mut seen: HashSet<&str> = HashSet::new();
             st.entries
@@ -743,12 +721,14 @@ pub fn run_rollback(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
     };
 
     let mut rolled_back: Vec<&str> = Vec::new();
+    let mut failed: Vec<&str> = Vec::new();
     for e in &targets {
         if e.previous_sha.is_empty() {
             eprintln!(
                 "  [{}] cannot roll back: no previous commit recorded",
                 e.plugin_id
             );
+            failed.push(&e.plugin_id);
             continue;
         }
         let Some((owner, repo)) = owner_repo_of(&e.plugin_id) else {
@@ -756,6 +736,7 @@ pub fn run_rollback(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
                 "  [{}] cannot roll back: plugin not in registry",
                 e.plugin_id
             );
+            failed.push(&e.plugin_id);
             continue;
         };
         if !json {
@@ -766,7 +747,20 @@ pub fn run_rollback(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
                 short(&e.previous_sha)
             );
         }
-        if apply_update(&owner, &repo, Some(&e.previous_sha)) {
+        // Remove any old tracking override for the rollback SHA before
+        // installing it: even a crash must leave this commit quarantined.
+        st.tracking.retain(|t| {
+            !(t.plugin_id == e.plugin_id
+                && t.owner == owner
+                && t.repo == repo
+                && t.installed_sha == e.previous_sha)
+        });
+        if let Err(err) = st.save(&dir) {
+            eprintln!("  [{}] {err}", e.plugin_id);
+            failed.push(&e.plugin_id);
+            continue;
+        }
+        if install_verified(&e.plugin_id, &owner, &repo, &e.previous_sha) {
             // Record the rollback. herdr keeps the rolled-back SHA as
             // requested_ref, so this entry is the only place the original
             // tracking ref survives; `resume` needs it (v1.0.1).
@@ -780,8 +774,12 @@ pub fn run_rollback(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
             });
             if let Err(err) = st.save(&dir) {
                 eprintln!("  warning: {err}");
+                failed.push(&e.plugin_id);
+                continue;
             }
             rolled_back.push(&e.plugin_id);
+        } else {
+            failed.push(&e.plugin_id);
         }
     }
     if !json {
@@ -790,7 +788,13 @@ pub fn run_rollback(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
             rolled_back.len()
         );
     }
-    if rolled_back.is_empty() {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"rolled_back": rolled_back, "failed": failed})
+        );
+    }
+    if !failed.is_empty() || (rolled_back.is_empty() && !st.entries.is_empty()) {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
@@ -819,11 +823,8 @@ pub fn run_resume(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
             }
         },
         None => {
-            if st.entries.is_empty() {
-                if !json {
-                    eprintln!("[herdr-auto-update] no rollbacks recorded - nothing to resume");
-                }
-                return ExitCode::SUCCESS;
+            if st.entries.is_empty() && !json {
+                eprintln!("[herdr-auto-update] no rollbacks recorded - nothing to resume");
             }
             let mut seen: HashSet<&str> = HashSet::new();
             st.entries
@@ -837,20 +838,36 @@ pub fn run_resume(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
     };
 
     let mut resumed: Vec<&str> = Vec::new();
+    let mut failed: Vec<&str> = Vec::new();
     for e in &targets {
         let Some((owner, repo)) = owner_repo_of(&e.plugin_id) else {
             eprintln!("  [{}] cannot resume: plugin not in registry", e.plugin_id);
+            failed.push(&e.plugin_id);
             continue;
         };
         if !json {
             let track = e.requested_ref.as_deref().unwrap_or("<default branch>");
             println!("  [{}] resuming tracking ref {track}", e.plugin_id);
         }
+        if e.current_sha.is_empty() {
+            eprintln!(
+                "  [{}] cannot resume: no current commit recorded",
+                e.plugin_id
+            );
+            failed.push(&e.plugin_id);
+            continue;
+        }
         if apply_update(&owner, &repo, e.requested_ref.as_deref()) {
             // Record the resume as an update entry: the plugin is back on
             // the tracking ref at the current upstream commit.
-            let current_sha =
-                resolved_commit_of(&e.plugin_id).unwrap_or_else(|| e.current_sha.clone());
+            let Some(current_sha) =
+                resumed_commit_of(&e.plugin_id, &owner, &repo, e.requested_ref.as_deref())
+            else {
+                eprintln!("  [{}] cannot verify resumed commit", e.plugin_id);
+                failed.push(&e.plugin_id);
+                continue;
+            };
+            st.tracking.retain(|t| t.plugin_id != e.plugin_id);
             st.append(state::StateEntry {
                 plugin_id: e.plugin_id.clone(),
                 previous_sha: e.current_sha.clone(),
@@ -861,14 +878,24 @@ pub fn run_resume(cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
             });
             if let Err(err) = st.save(&dir) {
                 eprintln!("  warning: {err}");
+                failed.push(&e.plugin_id);
+                continue;
             }
             resumed.push(&e.plugin_id);
+        } else {
+            failed.push(&e.plugin_id);
         }
     }
     if !json {
         eprintln!("[herdr-auto-update] {} plugin(s) resumed", resumed.len());
     }
-    if resumed.is_empty() {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"resumed": resumed, "failed": failed})
+        );
+    }
+    if !failed.is_empty() || (resumed.is_empty() && !st.entries.is_empty()) {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
@@ -917,18 +944,30 @@ pub fn run_untrack(_cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
         println!("  [{id}] untracking: reinstalling {owner}/{repo} without --ref (default branch)");
     }
     if !apply_update(owner, repo, None) {
+        if json {
+            println!("{}", serde_json::json!({"untracked": [], "failed": [id]}));
+        }
         return ExitCode::from(1);
     }
     // Confirm herdr actually cleared the pin (ref-less install resolves the
     // default branch and records no requested_ref).
-    let still_pinned = registry::list_installed()
+    let cleared = registry::list_installed()
         .ok()
         .and_then(|ps| ps.into_iter().find(|p| p.plugin_id == id))
         .and_then(|p| p.source)
-        .map(|s| ref_kind(s.requested_ref.as_deref()) == RefKind::Commit)
+        .map(|s| {
+            s.kind == registry::GITHUB_KIND
+                && s.owner.as_deref() == Some(owner)
+                && s.repo.as_deref() == Some(repo)
+                && s.requested_ref.is_none()
+                && s.resolved_commit.is_some()
+        })
         .unwrap_or(false);
-    if still_pinned {
+    if !cleared {
         eprintln!("  [{id}] warning: registry still records a commit pin after reinstall");
+        if json {
+            println!("{}", serde_json::json!({"untracked": [], "failed": [id]}));
+        }
         return ExitCode::from(1);
     }
     if !json {
@@ -936,6 +975,9 @@ pub fn run_untrack(_cfg: &Config, json: bool, only: Option<&str>) -> ExitCode {
             "  [{id}] now tracking the default branch; run `herdr-auto-update update` to \
              apply available updates"
         );
+    }
+    if json {
+        println!("{}", serde_json::json!({"untracked": [id], "failed": []}));
     }
     ExitCode::SUCCESS
 }
@@ -976,19 +1018,37 @@ fn owner_repo_of(plugin_id: &str) -> Option<(String, String)> {
         .find(|p| p.plugin_id == plugin_id)
         .and_then(|p| {
             let s = p.source.as_ref()?;
+            if s.kind != registry::GITHUB_KIND {
+                return None;
+            }
             Some((s.owner.clone()?, s.repo.clone()?))
+        })
+        .filter(|(owner, repo)| {
+            registry::valid_github_name(owner, 39) && registry::valid_github_name(repo, 100)
         })
 }
 
 /// Current resolved commit for a plugin id from herdr's registry. `None`
 /// when the plugin is absent or the registry has no commit recorded.
-fn resolved_commit_of(plugin_id: &str) -> Option<String> {
+fn resumed_commit_of(
+    plugin_id: &str,
+    owner: &str,
+    repo: &str,
+    requested_ref: Option<&str>,
+) -> Option<String> {
     let plugins = registry::list_installed().ok()?;
     plugins
         .iter()
         .find(|p| p.plugin_id == plugin_id)
         .and_then(|p| p.source.as_ref())
+        .filter(|s| {
+            s.kind == registry::GITHUB_KIND
+                && s.owner.as_deref() == Some(owner)
+                && s.repo.as_deref() == Some(repo)
+                && s.requested_ref.as_deref() == requested_ref
+        })
         .and_then(|s| s.resolved_commit.clone())
+        .filter(|sha| sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// A plugin whose remote commit still needs resolving (network call).
@@ -1089,18 +1149,31 @@ fn collect(cfg: &Config, only: Option<&str>, json: bool) -> Result<Vec<PluginSta
         // A commit-pinned plugin is immutable by construction: the pin IS the
         // installed commit, so it can never be behind upstream and is never
         // updated. Skip the network entirely (v0.4 ref channels).
-        if ref_kind(src.requested_ref.as_deref()) == RefKind::Commit {
+        let tracking = rollback_state.as_ref().and_then(|s| {
+            s.tracking.iter().rev().find(|t| {
+                t.plugin_id == p.plugin_id
+                    && t.owner == *owner
+                    && t.repo == *repo
+                    && t.installed_sha == *rc
+                    && src.requested_ref.as_deref() == Some(rc.as_str())
+            })
+        });
+        let requested_ref = tracking
+            .map(|t| t.requested_ref.clone())
+            .unwrap_or_else(|| src.requested_ref.clone());
+        if ref_kind(requested_ref.as_deref()) == RefKind::Commit {
             // Distinguish a rollback quarantine (resume is the way back)
             // from an install-time commit pin (untrack is the way back).
             let note = rollback_state
                 .as_ref()
                 .and_then(|s| s.latest_for(&p.plugin_id))
                 .filter(|e| e.result == "rolled_back")
+                .filter(|e| e.current_sha == *rc)
                 .map(|_| "pinned by rollback; run `resume` to rejoin the tracking ref".to_string())
                 .or_else(|| {
                     Some(
-                        "pinned to a commit; not auto-updated (run `herdr-auto-update update` \
-                         from a terminal to update it interactively)"
+                        "pinned to a commit; not auto-updated (run `untrack --only <plugin_id>` \
+                         to switch to the default branch)"
                             .to_string(),
                     )
                 });
@@ -1130,7 +1203,7 @@ fn collect(cfg: &Config, only: Option<&str>, json: bool) -> Result<Vec<PluginSta
             repo: repo.clone(),
             version: p.version.clone(),
             installed_sha: rc.clone(),
-            requested_ref: src.requested_ref.clone(),
+            requested_ref,
         });
         statuses.push(None);
     }
@@ -1200,7 +1273,7 @@ fn collect(cfg: &Config, only: Option<&str>, json: bool) -> Result<Vec<PluginSta
                 remote_version: result.remote_version,
                 update_available: result.status == Status::Behind,
                 status: result.status,
-                ref_kind: ref_kind(job.requested_ref.as_deref()),
+                ref_kind: result.ref_kind,
                 requested_ref: job.requested_ref.clone(),
                 error: result.error,
                 note: None,
@@ -1223,6 +1296,7 @@ fn collect(cfg: &Config, only: Option<&str>, json: bool) -> Result<Vec<PluginSta
 
 /// Result of resolving one plugin's remote state (ls-remote + compare API).
 struct JobResult {
+    ref_kind: RefKind,
     remote_sha: Option<String>,
     status: Status,
     error: Option<String>,
@@ -1234,15 +1308,16 @@ struct JobResult {
 /// commit. API failures degrade to `Unknown` (safe side: no update); the
 /// cache keeps rate-limited repos retryable next run.
 fn resolve_job(job: &RemoteJob, timeout_secs: u64, cache: &compare::Cache) -> JobResult {
-    let remote = match remote_head(
+    let (remote, kind) = match remote_head(
         &job.owner,
         &job.repo,
         job.requested_ref.as_deref(),
         timeout_secs,
     ) {
-        Ok(Some(sha)) => sha,
+        Ok(Some(resolved)) => resolved,
         Ok(None) => {
             return JobResult {
+                ref_kind: ref_kind(job.requested_ref.as_deref()),
                 remote_sha: None,
                 status: Status::Unknown,
                 error: Some("cannot resolve remote HEAD (repo moved or deleted?)".to_string()),
@@ -1252,6 +1327,7 @@ fn resolve_job(job: &RemoteJob, timeout_secs: u64, cache: &compare::Cache) -> Jo
         }
         Err(e) => {
             return JobResult {
+                ref_kind: ref_kind(job.requested_ref.as_deref()),
                 remote_sha: None,
                 status: Status::Unknown,
                 error: Some(e),
@@ -1262,6 +1338,7 @@ fn resolve_job(job: &RemoteJob, timeout_secs: u64, cache: &compare::Cache) -> Jo
     };
     if remote == job.installed_sha {
         return JobResult {
+            ref_kind: kind,
             remote_sha: Some(remote),
             status: Status::Same,
             error: None,
@@ -1272,7 +1349,7 @@ fn resolve_job(job: &RemoteJob, timeout_secs: u64, cache: &compare::Cache) -> Jo
     // The remote ref changed: resolve a human version name for the display
     // (newest tag, or the pinned tag itself). Best-effort and only paid for
     // plugins that actually moved.
-    let remote_version = remote_version_for(job, timeout_secs);
+    let remote_version = remote_version_for(job, kind, timeout_secs);
     // Ref changed: classify via the compare API (cached). Failure degrades
     // to Unknown - we cannot prove it is a fast-forward, so no update.
     match compare::classify(
@@ -1284,6 +1361,7 @@ fn resolve_job(job: &RemoteJob, timeout_secs: u64, cache: &compare::Cache) -> Jo
         cache,
     ) {
         Ok(compare::CompareStatus::Identical) => JobResult {
+            ref_kind: kind,
             remote_sha: Some(remote),
             status: Status::Same,
             error: None,
@@ -1291,6 +1369,7 @@ fn resolve_job(job: &RemoteJob, timeout_secs: u64, cache: &compare::Cache) -> Jo
             cache_entries: Vec::new(),
         },
         Ok(compare::CompareStatus::Ahead) => JobResult {
+            ref_kind: kind,
             remote_sha: Some(remote.clone()),
             status: Status::Behind,
             error: None,
@@ -1298,6 +1377,7 @@ fn resolve_job(job: &RemoteJob, timeout_secs: u64, cache: &compare::Cache) -> Jo
             cache_entries: cache_entry(job, &remote, compare::CompareStatus::Ahead),
         },
         Ok(compare::CompareStatus::Behind) => JobResult {
+            ref_kind: kind,
             remote_sha: Some(remote.clone()),
             status: Status::Ahead,
             error: None,
@@ -1305,6 +1385,7 @@ fn resolve_job(job: &RemoteJob, timeout_secs: u64, cache: &compare::Cache) -> Jo
             cache_entries: cache_entry(job, &remote, compare::CompareStatus::Behind),
         },
         Ok(compare::CompareStatus::Diverged) => JobResult {
+            ref_kind: kind,
             remote_sha: Some(remote.clone()),
             status: Status::Diverged,
             error: None,
@@ -1312,6 +1393,7 @@ fn resolve_job(job: &RemoteJob, timeout_secs: u64, cache: &compare::Cache) -> Jo
             cache_entries: cache_entry(job, &remote, compare::CompareStatus::Diverged),
         },
         Err(e) => JobResult {
+            ref_kind: kind,
             remote_sha: Some(remote),
             status: Status::Unknown,
             error: Some(e),
@@ -1326,10 +1408,10 @@ fn resolve_job(job: &RemoteJob, timeout_secs: u64, cache: &compare::Cache) -> Jo
 /// `git ls-remote --tags --sort=-v:refname` (client-side version sort).
 /// Best-effort display metadata; any failure yields `None` (the caller then
 /// falls back to the short SHA).
-fn remote_version_for(job: &RemoteJob, timeout_secs: u64) -> Option<String> {
+fn remote_version_for(job: &RemoteJob, kind: RefKind, timeout_secs: u64) -> Option<String> {
     if let Some(r) = &job.requested_ref {
-        if let Some(tag) = r.strip_prefix("refs/tags/") {
-            return Some(tag.to_string());
+        if kind == RefKind::Tag {
+            return Some(r.strip_prefix("refs/tags/").unwrap_or(r).to_string());
         }
     }
     let url = format!("https://github.com/{}/{}", job.owner, job.repo);
@@ -1375,29 +1457,63 @@ fn remote_head(
     repo: &str,
     requested_ref: Option<&str>,
     timeout_secs: u64,
-) -> Result<Option<String>, String> {
+) -> Result<Option<(String, RefKind)>, String> {
     let url = format!("https://github.com/{owner}/{repo}");
     let mut args: Vec<&str> = GIT_TIMEOUT_ARGS.to_vec();
     args.push("ls-remote");
     args.push(&url);
     args.push(requested_ref.unwrap_or("HEAD"));
+    let peeled = format!("{}^{{}}", requested_ref.unwrap_or("HEAD"));
+    args.push(&peeled);
     let out = run_with_timeout(&git_bin(), &args, timeout_secs)?;
     if !out.status.success() {
         return Ok(None);
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    let sha = text
+    resolve_remote_output(&text, requested_ref)
+}
+
+fn resolve_remote_output(
+    text: &str,
+    requested_ref: Option<&str>,
+) -> Result<Option<(String, RefKind)>, String> {
+    let requested = requested_ref.unwrap_or("HEAD");
+    let rows: Vec<(&str, &str)> = text
         .lines()
-        .next()
-        .unwrap_or("")
-        .split_whitespace()
-        .next()
-        .unwrap_or("");
-    if sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()) {
-        Ok(Some(sha.to_owned()))
-    } else {
-        Ok(None)
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let sha = parts.next()?;
+            let name = parts.next()?;
+            (sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit())).then_some((sha, name))
+        })
+        .collect();
+    let matches: Vec<_> = rows
+        .iter()
+        .filter(|(_, name)| {
+            *name == requested
+                || (!requested.starts_with("refs/")
+                    && (*name == format!("refs/heads/{requested}")
+                        || *name == format!("refs/tags/{requested}")))
+        })
+        .collect();
+    if matches.len() > 1 {
+        return Err(format!("ambiguous remote ref: {requested}"));
     }
+    let Some((sha, name)) = matches.first() else {
+        return Ok(None);
+    };
+    let kind = if name.starts_with("refs/tags/") {
+        RefKind::Tag
+    } else {
+        RefKind::Branch
+    };
+    let peeled = format!("{name}^{{}}");
+    let sha = rows
+        .iter()
+        .find(|(_, name)| *name == peeled)
+        .map(|(sha, _)| *sha)
+        .unwrap_or(sha);
+    Ok(Some((sha.to_string(), kind)))
 }
 
 /// Run an external binary with a wall-clock deadline. `timeout_secs == 0`
@@ -1407,67 +1523,168 @@ fn remote_head(
 /// against the wait loop; a timed-out process is killed and reaped before we
 /// return.
 pub fn run_with_timeout(bin: &str, args: &[&str], timeout_secs: u64) -> Result<Output, String> {
-    let mut child = Command::new(bin)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("cannot run {bin}: {e}"))?;
-    if timeout_secs == 0 {
-        return child
-            .wait_with_output()
-            .map_err(|e| format!("cannot run {bin}: {e}"));
-    }
-    let stdout = child.stdout.take().expect("stdout piped");
-    let stderr = child.stderr.take().expect("stderr piped");
-    let stdout_reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let mut stdout = stdout;
-        let _ = stdout.read_to_end(&mut buf);
-        buf
-    });
-    let stderr_reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let mut stderr = stderr;
-        let _ = stderr.read_to_end(&mut buf);
-        buf
-    });
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if Instant::now() >= deadline {
+    let started = Instant::now();
+    let mut cmd = Command::new(bin);
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    let (stdout, stderr) = {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::{net::UnixStream, process::CommandExt};
+        cmd.process_group(0);
+        let (out_read, out_write) = UnixStream::pair().map_err(|e| e.to_string())?;
+        let (err_read, err_write) = UnixStream::pair().map_err(|e| e.to_string())?;
+        out_read.set_nonblocking(true).map_err(|e| e.to_string())?;
+        err_read.set_nonblocking(true).map_err(|e| e.to_string())?;
+        cmd.stdout(Stdio::from(OwnedFd::from(out_write)));
+        cmd.stderr(Stdio::from(OwnedFd::from(err_write)));
+        (out_read, err_read)
+    };
+    let mut child = cmd.spawn().map_err(|e| format!("cannot run {bin}: {e}"))?;
+    // Command retains its configured descriptors; close the parent's writers.
+    drop(cmd);
+    #[cfg(windows)]
+    let (stdout, stderr) = (
+        child.stdout.take().expect("stdout piped"),
+        child.stderr.take().expect("stderr piped"),
+    );
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel();
+    let stdout_reader = spawn_reader(stdout, 0, tx.clone(), cancel.clone());
+    let stderr_reader = spawn_reader(stderr, 1, tx, cancel.clone());
+    let mut status = None;
+    let mut buffers = [None, None];
+    let result = loop {
+        if timeout_secs != 0 && started.elapsed() >= Duration::from_secs(timeout_secs) {
+            // The leader may already be gone while descendants still own pipes.
+            kill_process_tree(&mut child);
+            break Err(format!("{bin} timed out after {timeout_secs}s"));
+        }
+        while let Ok((index, bytes)) = rx.try_recv() {
+            buffers[index] = Some(bytes);
+        }
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(s) => status = s,
+                Err(e) => {
                     kill_process_tree(&mut child);
-                    return Err(format!("{bin} timed out after {timeout_secs}s"));
+                    break Err(format!("cannot wait for {bin}: {e}"));
                 }
             }
-            Err(e) => {
-                kill_process_tree(&mut child);
-                return Err(format!("cannot wait for {bin}: {e}"));
+        }
+        if let Some(status) = status {
+            if buffers.iter().all(Option::is_some) {
+                break Ok(Output {
+                    status,
+                    stdout: buffers[0].take().unwrap(),
+                    stderr: buffers[1].take().unwrap(),
+                });
             }
         }
-        // Brief sleep so a hung child does not busy-spin the worker.
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(10));
     };
-    let stdout = stdout_reader.join().unwrap_or_default();
-    let stderr = stderr_reader.join().unwrap_or_default();
-    Ok(Output {
-        status,
-        stdout,
-        stderr,
+    cancel.store(true, Ordering::Relaxed);
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+    result
+}
+
+#[cfg(unix)]
+fn spawn_reader(
+    mut pipe: std::os::unix::net::UnixStream,
+    index: usize,
+    tx: mpsc::Sender<(usize, Vec<u8>)>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut buf = [0; 8192];
+        while !cancel.load(Ordering::Relaxed) {
+            match pipe.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => bytes.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        let _ = tx.send((index, bytes));
+    })
+}
+
+#[cfg(windows)]
+fn spawn_reader<P: Read + std::os::windows::io::AsRawHandle + Send + 'static>(
+    mut pipe: P,
+    index: usize,
+    tx: mpsc::Sender<(usize, Vec<u8>)>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    // Peek prevents Read from blocking on a descendant's inherited writer,
+    // including when taskkill cannot find an already-exited leader.
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn PeekNamedPipe(
+            handle: *mut std::ffi::c_void,
+            buffer: *mut std::ffi::c_void,
+            size: u32,
+            read: *mut u32,
+            available: *mut u32,
+            left: *mut u32,
+        ) -> i32;
+    }
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut buf = [0; 8192];
+        while !cancel.load(Ordering::Relaxed) {
+            let mut available = 0;
+            // SAFETY: pipe owns a live handle; only available is written.
+            let ok = unsafe {
+                PeekNamedPipe(
+                    pipe.as_raw_handle(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut available,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                break;
+            }
+            if available == 0 {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            let count = (available as usize).min(buf.len());
+            match pipe.read(&mut buf[..count]) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => bytes.extend_from_slice(&buf[..n]),
+            }
+        }
+        let _ = tx.send((index, bytes));
     })
 }
 
 /// Terminate the child and its whole process tree, then reap it.
 ///
-/// On Unix, killing the direct child is enough. On Windows a `.cmd`/`.bat`
+/// Unix subprocesses have their own process group, including descendants.
+/// On Windows a `.cmd`/`.bat`
 /// stub runs under `cmd.exe /c`, and `Child::kill()` (TerminateProcess)
 /// only terminates that direct child — grandchildren such as `ping` or
 /// git's ssh/remote-helper children survive and `wait()` blocks until they
 /// exit on their own. `taskkill /T /F` kills the tree, so the deadline is
-/// actually enforced. Windows-only: on Unix this is just kill + wait.
+/// actually enforced. Nonblocking readers also bound collection if the
+/// leader has exited and Windows can no longer enumerate its descendants.
 fn kill_process_tree(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("/bin/kill")
+            .args(["-KILL", "--", &format!("-{}", child.id())])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
     // Order matters on Windows: `taskkill /T /F` must run while the tree is
     // still intact. `Child::kill()` (TerminateProcess) terminates only the
     // direct child — for a `.cmd`/`.bat` stub that is `cmd.exe` itself —
@@ -1480,6 +1697,8 @@ fn kill_process_tree(child: &mut Child) {
         let pid = child.id().to_string();
         let _ = Command::new("taskkill")
             .args(["/PID", pid.as_str(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status();
     }
     let _ = child.kill();
@@ -1641,16 +1860,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn yes_answer_accepts_y_and_yes_only() {
-        assert!(yes_answer("y"));
-        assert!(yes_answer("Y"));
-        assert!(yes_answer("yes"));
-        assert!(yes_answer("  Yes \n"));
-        assert!(!yes_answer(""));
-        assert!(!yes_answer("n"));
-        assert!(!yes_answer("N"));
-        assert!(!yes_answer("no"));
-        assert!(!yes_answer("maybe"));
+    fn exact_refs_classify_and_peel_tags() {
+        let object = "a".repeat(40);
+        let commit = "b".repeat(40);
+        let text = format!(
+            "{object} refs/tags/v1.0\n{commit} refs/tags/v1.0^{{}}\n{object} refs/heads/other\n"
+        );
+        assert_eq!(
+            resolve_remote_output(&text, Some("v1.0")).unwrap(),
+            Some((commit.clone(), RefKind::Tag))
+        );
+        assert_eq!(
+            resolve_remote_output(&text, Some("refs/tags/v1.0")).unwrap(),
+            Some((commit, RefKind::Tag))
+        );
+        assert!(
+            resolve_remote_output(&format!("{text}{object} refs/heads/v1.0\n"), Some("v1.0"))
+                .is_err()
+        );
+        assert_eq!(
+            resolve_remote_output(&text, Some("other")).unwrap(),
+            Some((object, RefKind::Branch))
+        );
+        assert_eq!(resolve_remote_output(&text, None).unwrap(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_covers_descendant_pipes_after_leader_exit() {
+        let started = Instant::now();
+        let result = run_with_timeout("/bin/sh", &["-c", "sleep 30 & printf done; exit 0"], 1);
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let output =
+            run_with_timeout("/bin/sh", &["-c", "printf done; printf error >&2"], 0).unwrap();
+        assert_eq!(output.stdout, b"done");
+        assert_eq!(output.stderr, b"error");
     }
 
     #[test]

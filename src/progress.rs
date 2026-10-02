@@ -146,8 +146,12 @@ impl Progress {
 
 /// Run `f` while animating `label` on a single line (TTY only); returns
 /// `f`'s result and clears the line. Non-TTY: runs `f` without decoration.
-pub fn with_activity(label: &str, f: impl FnOnce() -> bool + Send + 'static) -> bool {
-    if !std::io::stdout().is_terminal() {
+pub fn with_activity(
+    label: &str,
+    disabled: bool,
+    f: impl FnOnce() -> bool + Send + 'static,
+) -> bool {
+    if disabled || !std::io::stdout().is_terminal() {
         return f();
     }
     let handle = std::thread::spawn(f);

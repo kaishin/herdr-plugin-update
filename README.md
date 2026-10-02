@@ -256,6 +256,12 @@ directory (append-only; the latest entry per plugin is the rollback target).
 `herdr-auto-update history` prints the audit trail; `history --json` emits it
 machine-readable.
 
+Updates install the exact upstream commit verified by the plan. Before
+installing, local state preserves the original branch, tag, or default-HEAD
+tracking ref. Later checks restore that channel only when the plugin id,
+source repository, installed commit, and registry SHA pin match. If tracking
+state cannot be saved, installation is blocked.
+
 ```bash
 herdr-auto-update history
 herdr-auto-update history --json
@@ -268,7 +274,8 @@ before its **most recent** update (`herdr plugin install <owner>/<repo>
 --ref <previous-sha>`), using state. Older history is never rewound: an
 A→B→C trail rolls back to B, not to A. `rollback --only <plugin_id>`
 restricts the target. Plugins without a recorded previous commit are
-skipped with a warning; a plugin that is already rolled back is left alone.
+reported as failures; a plugin that is already rolled back is left alone.
+Rollback and resume return nonzero if any target fails, including partial success.
 
 Rolling back pin installs the previous commit, so herdr records it as a
 commit pin (`--ref <sha>`). By design that **quarantines** the plugin: it is
@@ -289,7 +296,7 @@ the full trail: `updated` → `rolled_back` → `updated`.
 
 ### Pinned plugins (commit pins)
 
-A plugin whose `requested_ref` is a commit SHA is **pinned to a commit**:
+A plugin manually installed with a commit SHA is **pinned to a commit**:
 it is never auto-updated (the pin IS the installed commit). `check`/`plan`
 show `channel: commit`, and `update`/`startup` report it as `pinned` (JSON
 report field, stderr summary, and desktop notification) instead of silently
@@ -297,12 +304,9 @@ listing it as up to date.
 
 This happens after a `rollback` (rejoin with `resume`) and for installs that
 were pinned to a specific commit. To update a commit-pinned plugin, run
-`herdr-auto-update update` from a terminal: each pinned plugin is offered a
-prompt (`reinstall from the default branch to update? [y/N]`) that clears
-the pin and moves it to the default branch's latest commit in one step.
-herdr's startup auto-update never prompts — it only reports pinned plugins.
-For scripts, `untrack --only <plugin_id>` does the same reinstall
-non-interactively.
+`herdr-auto-update untrack --only <plugin_id>` explicitly: it clears the pin
+and reinstalls from the default branch. Update, apply, and startup never
+clear pins or install held entries, even interactively.
 
 `check`/`update` lead every plugin line with a status word that states the
 outcome explicitly: `✓ No changes needed` (green — nothing to do), `✓ Updated`
