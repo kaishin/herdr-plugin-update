@@ -6,6 +6,15 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to build and publish
+        required: true
+        type: string
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 permissions:
   contents: write
@@ -21,9 +30,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
       - name: Tag/version consistency
         run: |
-          tag="${GITHUB_REF#refs/tags/v}"
+          tag="${RELEASE_TAG#v}"
           cargo_ver=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *"\(.*\)"/\1/')
           plugin_ver=$(grep -m1 '^version' herdr-plugin.toml | sed 's/.*= *"\(.*\)"/\1/')
           test "$tag" = "$cargo_ver" || { echo "tag v$tag != Cargo.toml $cargo_ver"; exit 1; }
@@ -50,6 +61,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -86,7 +99,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ver="${GITHUB_REF#refs/tags/v}"
+          ver="${RELEASE_TAG#v}"
           triple="${{ matrix.target }}"
           exe="target/${{ matrix.target }}/release/herdr-auto-update"
           if [ "${{ runner.os }}" = "Windows" ]; then exe="$exe.exe"; fi
@@ -113,7 +126,7 @@ jobs:
       - name: Generate checksums
         run: |
           set -euo pipefail
-          ver="${GITHUB_REF#refs/tags/v}"
+          ver="${RELEASE_TAG#v}"
           cd assets
           count=$(ls -1 herdr-auto-update-*.tar.gz | wc -l)
           test "$count" -eq 5 || { echo "expected 5 tarballs, got $count"; exit 1; }
@@ -122,6 +135,7 @@ jobs:
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
           files: |
             assets/herdr-auto-update-*.tar.gz
             assets/checksums-*.txt
