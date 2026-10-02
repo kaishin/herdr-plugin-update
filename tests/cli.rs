@@ -112,8 +112,8 @@ if \"%1\"==\"plugin\" if \"%2\"==\"install\" (\r\n\
   echo %*>> \"%~dp0installs.log\"\r\n\
   echo installer output\r\n\
   if exist \"%~dp0no-mutation\" exit /b 0\r\n\
-  set \"HAU_STUB_SOURCE=%3\"\r\n\
-  set \"HAU_STUB_REF=%5\"\r\n\
+  set \"HAU_STUB_SOURCE=%~3\"\r\n\
+  set \"HAU_STUB_REF=%~5\"\r\n\
   \"%HAU_TEST_EXE%\" --ignored --exact stub_install_entrypoint >nul\r\n\
   exit /b 0\r\n\
 )\r\n\
